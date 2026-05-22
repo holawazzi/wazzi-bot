@@ -234,6 +234,37 @@ async function notificarTaxistas(origen, destino, tipo, pedidoId, clienteTel) {
   }
 }
 
+// ---- NOTIFICAR CLIENTE CUANDO TAXISTA ACEPTA ----
+app.post('/notificar-cliente', async (req, res) => {
+  const { cliente_telefono, taxista_nombre, placa, taxista_telefono, precio, minutos } = req.body;
+
+  if(!cliente_telefono) return res.status(400).json({ error: 'Falta telefono del cliente' });
+
+  try {
+    const msg = `✅ *¡Tu taxi está en camino!*
+
+🚖 *${taxista_nombre}*
+🚗 Placa: ${placa}
+💰 Precio acordado: $${parseInt(precio).toLocaleString('es-CO')}
+⏱️ Llega en aproximadamente: *${minutos} minutos*
+
+${taxista_telefono ? `📞 Número del taxista: +57${taxista_telefono.replace(/\s/g,'')}` : ''}
+
+Escribe *menu* si necesitas algo más. 🚖`;
+
+    await twilioClient.messages.create({
+      from: `whatsapp:${process.env.TWILIO_SANDBOX_NUMBER}`,
+      to: cliente_telefono,
+      body: msg
+    });
+
+    res.json({ ok: true });
+  } catch(e) {
+    console.error('Error notificando cliente:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ---- HEALTH CHECK ----
 app.get('/', (req, res) => {
   res.json({ status: 'Wazzi Bot corriendo 🚖', version: '1.0' });
