@@ -7,150 +7,205 @@ const app = express();
 app.use(express.urlencoded({ extended: false }));
 app.use(express.json());
 
-// Firebase Admin init
-const firebaseConfig = {
-  projectId: process.env.FIREBASE_PROJECT_ID,
-  clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
-  privateKey: process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, '\n'),
-};
-
-initializeApp({ credential: cert(firebaseConfig) });
+// Firebase Admin
+initializeApp({
+  credential: cert({
+    projectId: process.env.FIREBASE_PROJECT_ID,
+    clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
+    privateKey: process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n'),
+  })
+});
 const db = getFirestore();
 
-// Twilio client
+// Twilio
 const twilioClient = twilio(
   process.env.TWILIO_ACCOUNT_SID,
   process.env.TWILIO_AUTH_TOKEN
 );
 
-// Sesiones de conversacion en memoria
+// Sesiones en memoria
 const sesiones = {};
 
-// ---- FLUJO DEL BOT ----
-const MENU_PRINCIPAL = `🚖 *Bienvenido a Wazzi*
-Tu servicio de taxis en Villanueva, Casanare.
+// Menus
+const MENU = 'Wazzi - Tu servicio de taxis en Villanueva\n\n1. Pedir taxi\n2. Ver taxistas disponibles\n3. Viajes intermunicipales\n4. Negocios de Villanueva\n\nResponde con el numero de tu opcion.';
+const MENU_TIPO = 'Que tipo de servicio necesitas?\n\n1. Local - dentro de Villanueva\n2. Expreso - a corregimientos\n3. Volver al menu principal';
 
-¿Qué necesitas?
-1️⃣ Pedir taxi
-2️⃣ Ver taxistas disponibles
-3️⃣ Viajes intermunicipales
-4️⃣ Negocios de Villanueva
+// Enviar mensaje WhatsApp
+async function enviar(to, body) {
+  await twilioClient.messages.create({
+    from: 'whatsapp:' + process.env.TWILIO_SANDBOX_NUMBER,
+    to: to,
+    body: body
+  });
+}
 
-Responde con el número de tu opción.`;
+// Buscar cliente en Firebase
+async function buscarCliente(telefono) {
+  const snap = await db.collection('usuarios').where('telefono', '==', telefono).limit(1).get();
+  if (!snap.empty) return snap.docs[0].data();
+  return null;
+}
 
-const MENU_TIPO_SERVICIO = `¿Qué tipo de servicio necesitas?
-1️⃣ Local — dentro de Villanueva
-2️⃣ Expreso — a corregimientos
-   (Caribayona, San Agustín, Santa Helena)
-3️⃣ Volver al menú principal`;
+// Registrar cliente
+async function registrarCliente(telefono, nombre) {
+  await db.collection('usuarios').add({
+    nombre: nombre,
+    telefono: telefono,
+    rol: 'client',
+    ciudad: 'Villanueva',
+    canal: 'whatsapp',
+    fecha_registro: Timestamp.now()
+  });
+}
 
-const CORREGIMIENTOS = ['caribayona', 'san agustín', 'san agustin', 'santa helena', 'santa helena de upía'];
-const INTERMUNICIPALES = ['yopal', 'monterrey', 'tauramena', 'aguazul', 'barranca de upía', 'barranca de upia', 'villavicencio', 'cumaral', 'restrepo'];
+// Notificar taxistas
+async function notificarTaxistas(origen, destino, tipo, pedidoId) {
+  try {
+    const snap = await db.collection('taxistas').where('disponible', '==', true).get();
+    for (const doc of snap.docs) {
+      const t = doc.data();
+      if (!t.telefono) continue;
+      const tel = t.telefono.toString().replace(/\s/g, '');
+      const msg = 'Nuevo pedido en Wazzi\n\nDesde: ' + origen + '\nHasta: ' + destino + '\nTipo: ' + tipo + '\n\nResponde SI ' + pedidoId + ' para tomar este servicio.';
+      try {
+        await twilioClient.messages.create({
+          from: 'whatsapp:' + process.env.TWILIO_SANDBOX_NUMBER,
+          to: 'whatsapp:+57' + tel,
+          body: msg
+        });
+      } catch(e) {
+        console.log('Error notificando taxista ' + tel + ': ' + e.message);
+      }
+    }
+  } catch(e) {
+    console.error('Error notificando taxistas:', e);
+  }
+}
 
-// ---- WEBHOOK PRINCIPAL ----
+// Webhook principal
 app.post('/webhook', async (req, res) => {
   const from = req.body.From;
-  const body = req.body.Body?.trim().toLowerCase();
-  const bodyOriginal = req.body.Body?.trim();
+  const body = (req.body.Body || '').trim().toLowerCase();
+  const bodyOriginal = (req.body.Body || '').trim();
 
   if (!from || !body) return res.sendStatus(200);
 
-  // Iniciar sesion si no existe
   if (!sesiones[from]) {
-    sesiones[from] = { paso: 'menu' };
+    sesiones[from] = { paso: 'inicio' };
   }
 
   const sesion = sesiones[from];
   let respuesta = '';
 
   try {
-    // ---- VERIFICAR SI EL CLIENTE ESTA REGISTRADO ----
-    if (sesion.paso === 'menu' && !sesion.registrado) {
-      // Buscar en Firebase si ya existe
-      const clienteSnap = await db.collection('usuarios')
-        .where('telefono', '==', from)
-        .limit(1)
-        .get();
 
-      if (!clienteSnap.empty) {
-        // Ya existe — cargar nombre y continuar
-        const clienteData = clienteSnap.docs[0].data();
-        sesiones[from] = { ...sesion, registrado: true, nombre: clienteData.nombre };
-      } else if (body !== 'menu' && body !== 'hola' && body !== 'inicio' && body !== '0') {
-        // No existe y no está en flujo de registro — pedir nombre
+    // PASO: INICIO - verificar si esta registrado
+    if (sesion.paso === 'inicio' || body === 'menu' || body === 'hola' || body === 'inicio') {
+      const cliente = await buscarCliente(from);
+      if (cliente) {
+        sesiones[from] = { paso: 'menu', nombre: cliente.nombre, registrado: true };
+        respuesta = 'Hola de nuevo ' + cliente.nombre + '!\n\n' + MENU;
+      } else {
         sesiones[from] = { paso: 'pedir_nombre' };
-        respuesta = 'Bienvenido a Wazzi! Tu servicio de taxis en Villanueva.\n\nCual es tu nombre?';
+        respuesta = 'Bienvenido a Wazzi! Tu servicio de taxis en Villanueva, Casanare.\n\nCual es tu nombre?';
       }
     }
 
-    // ---- GUARDAR NOMBRE ----
-    if (sesion.paso === 'pedir_nombre') {
+    // PASO: PEDIR NOMBRE
+    else if (sesion.paso === 'pedir_nombre') {
       const nombre = bodyOriginal.trim();
       if (nombre.length < 2) {
-        respuesta = '⚠️ Por favor escribe tu nombre completo.';
+        respuesta = 'Por favor escribe tu nombre completo.';
       } else {
-        // Guardar en Firebase
-        await db.collection('usuarios').add({
-          nombre: nombre,
-          telefono: from,
-          rol: 'client',
-          ciudad: 'Villanueva',
-          canal: 'whatsapp',
-          fecha_registro: Timestamp.now()
-        });
-        sesiones[from] = { paso: 'menu', registrado: true, nombre: nombre };
-        re        respuesta = 'Hola ' + nombre + '! Ya quedaste registrado en Wazzi.\n\n' + MENU_PRINCIPAL;
-    
+        await registrarCliente(from, nombre);
+        sesiones[from] = { paso: 'menu', nombre: nombre, registrado: true };
+        respuesta = 'Hola ' + nombre + '! Ya quedaste registrado en Wazzi.\n\n' + MENU;
       }
     }
 
-    // ---- MENU PRINCIPAL ----
-    else if (body === 'hola' || body === 'menu' || body === '0' || body === 'inicio') {
-      sesiones[from] = { ...sesion, paso: 'menu' };
-      const salsesion.nombre ? 'Hola de nuevo, ' + sesion.nombre + '!\n\n' : '';     respuesta = saludo + MENU_PRINCIPAL;
-    }
-    else if (sesion.paso === 'menu' && !['1','2','3','4'].includes(body)) {
-      const saludo = sesion.nombre ? 'Hola ' + sesion.nombre + ', ' : '';
-      respuesta = saludo ? saludo + 'no entendi esa opcion.\n\n' + MENU_PRINCIPAL : MENU_PRINCIPAL;
+    // MENU PRINCIPAL
+    else if (sesion.paso === 'menu') {
+
+      if (body === '1') {
+        sesiones[from] = { ...sesion, paso: 'tipo_servicio' };
+        respuesta = MENU_TIPO;
+      }
+      else if (body === '2') {
+        const snap = await db.collection('taxistas').where('disponible', '==', true).get();
+        if (snap.empty) {
+          respuesta = 'No hay taxistas disponibles ahora. Intenta en unos minutos.\n\nEscribe menu para volver.';
+        } else {
+          let lista = 'Taxistas disponibles ahora:\n\n';
+          snap.forEach(doc => {
+            const t = doc.data();
+            lista += t.nombre + ' ' + (t.apellido || '') + '\n';
+            lista += 'Placa: ' + (t.placa || 'N/A') + ' - ' + (t.paradero || 'N/A') + '\n';
+            lista += 'Servicio: ' + (t.tipo === 'intermunicipal' ? 'Intermunicipal' : 'Local/Expreso') + '\n\n';
+          });
+          lista += 'Escribe 1 para pedir un taxi.';
+          respuesta = lista;
+        }
+      }
+      else if (body === '3') {
+        sesiones[from] = { ...sesion, paso: 'intermunicipal' };
+        respuesta = 'Viajes intermunicipales disponibles:\n\nYopal\nMonterrey\nTauramena\nAguazul\nBarranca de Upia\nVillavicencio\nCumaral\nRestrepo\n\nEscribe el nombre de la ciudad a donde vas.';
+      }
+      else if (body === '4') {
+        const snap = await db.collection('negocios').where('activo', '==', true).get();
+        if (snap.empty) {
+          respuesta = 'Proximamente el directorio de negocios de Villanueva.\n\nEscribe menu para volver.';
+        } else {
+          let lista = 'Negocios de Villanueva:\n\n';
+          snap.forEach(doc => {
+            const n = doc.data();
+            lista += n.nombre + ' - ' + n.tipo + '\n';
+            lista += 'Tel: ' + n.telefono + '\n';
+            if (n.domicilio) lista += 'Hace domicilios\n';
+            lista += '\n';
+          });
+          respuesta = lista;
+        }
+      }
+      else {
+        respuesta = 'No entendi esa opcion.\n\n' + MENU;
+      }
     }
 
-    // ---- OPCION 1: PEDIR TAXI ----
-    else if ((sesion.paso === 'menu' && body === '1') || (sesion.paso === 'eligiendo_servicio' && sesion.accion === 'pedir')) {
-      sesiones[from] = { paso: 'tipo_servicio', accion: 'pedir' };
-      respuesta = MENU_TIPO_SERVICIO;
-    }
-
+    // TIPO DE SERVICIO
     else if (sesion.paso === 'tipo_servicio') {
       if (body === '1') {
         sesiones[from] = { ...sesion, paso: 'pedir_origen', tipo: 'local' };
-        respuesta = '📍 ¿Desde dónde te recogemos?\n\nEscribe tu dirección o referencia.\nEjemplo: _Frente al parque principal_';
+        respuesta = 'Desde donde te recogemos?\n\nEscribe tu direccion o referencia.\nEjemplo: Frente al parque principal';
       } else if (body === '2') {
         sesiones[from] = { ...sesion, paso: 'pedir_origen', tipo: 'expreso' };
-        respuesta = '📍 ¿Desde dónde te recogemos?\n\nEscribe tu dirección o referencia.';
+        respuesta = 'Desde donde te recogemos?\n\nEscribe tu direccion o referencia.';
       } else if (body === '3') {
-        sesiones[from] = { paso: 'menu' };
-        respuesta = MENU_PRINCIPAL;
+        sesiones[from] = { ...sesion, paso: 'menu' };
+        respuesta = MENU;
       } else {
-        respuesta = '⚠️ Por favor responde con 1, 2 o 3.';
+        respuesta = 'Por favor responde con 1, 2 o 3.';
       }
     }
 
+    // PEDIR ORIGEN
     else if (sesion.paso === 'pedir_origen') {
       sesiones[from] = { ...sesion, paso: 'pedir_destino', origen: bodyOriginal };
-      respuesta = `📍 Recojo en: *${bodyOriginal}*\n\n¿A dónde vas?\n\nEscribe tu destino.`;
+      respuesta = 'Recojo en: ' + bodyOriginal + '\n\nA donde vas?\n\nEscribe tu destino.';
     }
 
+    // PEDIR DESTINO
     else if (sesion.paso === 'pedir_destino') {
       sesiones[from] = { ...sesion, paso: 'confirmar_pedido', destino: bodyOriginal };
-      respuesta = `✅ *Confirma tu pedido:*\n\n🚖 Tipo: ${sesion.tipo === 'local' ? 'Local' : 'Expreso'}\n📍 Desde: ${sesion.origen}\n📍 Hasta: ${bodyOriginal}\n\n¿Confirmas?\n1️⃣ Sí, pedir taxi\n2️⃣ No, cancelar`;
+      const tipoLabel = sesion.tipo === 'local' ? 'Local' : 'Expreso';
+      respuesta = 'Confirma tu pedido:\n\nTipo: ' + tipoLabel + '\nDesde: ' + sesion.origen + '\nHasta: ' + bodyOriginal + '\n\n1. Si, pedir taxi\n2. No, cancelar';
     }
 
+    // CONFIRMAR PEDIDO
     else if (sesion.paso === 'confirmar_pedido') {
       if (body === '1') {
-        // Guardar pedido en Firebase
         const pedidoRef = await db.collection('pedidos').add({
           cliente_telefono: from,
-          cliente_nombre: 'Cliente WhatsApp',
+          cliente_nombre: sesion.nombre || 'Cliente WhatsApp',
           origen: sesion.origen,
           destino: sesion.destino,
           tipo: sesion.tipo,
@@ -160,145 +215,45 @@ app.post('/webhook', async (req, res) => {
           canal: 'whatsapp',
           fecha: Timestamp.now()
         });
-
-        // Notificar a taxistas disponibles
-        await notificarTaxistas(sesion.origen, sesion.destino, sesion.tipo, pedidoRef.id, from);
-
-        sesiones[from] = { paso: 'menu' };
-        respuesta = `✅ *¡Pedido enviado!*\n\nTu solicitud ya la ven los taxistas disponibles en Villanueva.\n\nTe avisamos cuando alguien la tome. 🚖\n\nEscribe *menu* para volver al inicio.`;
+        await notificarTaxistas(sesion.origen, sesion.destino, sesion.tipo, pedidoRef.id);
+        sesiones[from] = { paso: 'menu', nombre: sesion.nombre, registrado: true };
+        respuesta = 'Pedido enviado! Los taxistas ya lo ven.\n\nTe avisamos cuando alguien lo tome.\n\nEscribe menu si necesitas algo mas.';
       } else {
-        sesiones[from] = { paso: 'menu' };
-        respuesta = `❌ Pedido cancelado.\n\n${MENU_PRINCIPAL}`;
+        sesiones[from] = { ...sesion, paso: 'menu' };
+        respuesta = 'Pedido cancelado.\n\n' + MENU;
       }
     }
 
-    // ---- OPCION 2: VER TAXISTAS ----
-    else if (sesion.paso === 'menu' && body === '2') {
-      const taxistas = await db.collection('taxistas').where('disponible', '==', true).get();
-      if (taxistas.empty) {
-        respuesta = '😔 No hay taxistas disponibles en este momento.\n\nIntenta en unos minutos o escribe *menu* para volver.';
-      } else {
-        let lista = '🚖 *Taxistas disponibles ahora:*\n\n';
-        taxistas.forEach(doc => {
-          const t = doc.data();
-          lista += `👤 *${t.nombre} ${t.apellido || ''}*\n`;
-          lista += `🚗 Placa: ${t.placa || 'N/A'} · ${t.paradero || 'N/A'}\n`;
-          lista += `📋 Servicio: ${t.tipo === 'intermunicipal' ? 'Intermunicipal' : 'Local/Expreso'}\n\n`;
-        });
-        lista += 'Escribe *1* para pedir un taxi o *menu* para volver.';
-        respuesta = lista;
-      }
-      sesiones[from] = { paso: 'menu' };
-    }
-
-    // ---- OPCION 3: INTERMUNICIPALES ----
-    else if (sesion.paso === 'menu' && body === '3') {
-      sesiones[from] = { paso: 'intermunicipal' };
-      respuesta = `🚌 *Viajes intermunicipales*\n\n¿A qué ciudad vas?\n\n• Yopal\n• Monterrey\n• Tauramena\n• Aguazul\n• Barranca de Upía\n• Villavicencio\n• Cumaral\n• Restrepo\n\nEscribe el nombre de la ciudad.`;
-    }
-
+    // INTERMUNICIPAL
     else if (sesion.paso === 'intermunicipal') {
-      // Buscar viajes disponibles a ese destino
-      const destino = bodyOriginal;
-      sesiones[from] = { paso: 'menu' };
-      respuesta = `🔍 Buscando viajes disponibles a *${destino}*...\n\nEn este momento no hay viajes publicados a ${destino}.\n\nPuedes pedir un taxi privado respondiendo *1* en el menú principal.\n\nEscribe *menu* para volver.`;
+      sesiones[from] = { ...sesion, paso: 'menu' };
+      respuesta = 'Buscando viajes a ' + bodyOriginal + '...\n\nEn este momento no hay viajes publicados a ' + bodyOriginal + '.\n\nPuedes pedir un taxi privado respondiendo 1 en el menu.\n\nEscribe menu para volver.';
     }
 
-    // ---- OPCION 4: NEGOCIOS ----
-    else if (sesion.paso === 'menu' && body === '4') {
-      const negocios = await db.collection('negocios').where('activo', '==', true).get();
-      if (negocios.empty) {
-        respuesta = '🏪 Próximamente el directorio de negocios de Villanueva.\n\nEscribe *menu* para volver.';
-      } else {
-        let lista = '🏪 *Negocios de Villanueva:*\n\n';
-        negocios.forEach(doc => {
-          const n = doc.data();
-          lista += `*${n.nombre}* — ${n.tipo}\n`;
-          lista += `📞 ${n.telefono}\n`;
-          if (n.domicilio) lista += `🛵 Hace domicilios\n`;
-          lista += '\n';
-        });
-        lista += 'Escribe *menu* para volver.';
-        respuesta = lista;
-      }
-      sesiones[from] = { paso: 'menu' };
-    }
-
-    // ---- RESPUESTA DESCONOCIDA ----
+    // RESPUESTA DESCONOCIDA
     else {
-      sesiones[from] = { paso: 'menu' };
-      respuesta = MENU_PRINCIPAL;
+      sesiones[from] = { paso: 'inicio' };
+      respuesta = MENU;
     }
 
   } catch (error) {
     console.error('Error en bot:', error);
-    respuesta = '⚠️ Hubo un error. Por favor escribe *menu* para reiniciar.';
-    sesiones[from] = { paso: 'menu' };
+    respuesta = 'Hubo un error. Por favor escribe menu para reiniciar.';
+    sesiones[from] = { paso: 'inicio' };
   }
 
-  // Enviar respuesta
-  await twilioClient.messages.create({
-    from: `whatsapp:${process.env.TWILIO_SANDBOX_NUMBER}`,
-    to: from,
-    body: respuesta
-  });
-
+  await enviar(from, respuesta);
   res.sendStatus(200);
 });
 
-// ---- NOTIFICAR TAXISTAS ----
-async function notificarTaxistas(origen, destino, tipo, pedidoId, clienteTel) {
-  try {
-    const taxistas = await db.collection('taxistas')
-      .where('disponible', '==', true)
-      .get();
-
-    const promesas = [];
-    taxistas.forEach(doc => {
-      const t = doc.data();
-      if (!t.telefono) return;
-
-      const msg = `🚖 *Nuevo pedido en Wazzi*\n\n📍 Desde: ${origen}\n📍 Hasta: ${destino}\n📋 Tipo: ${tipo}\n\nResponde *SI ${pedidoId}* para tomar este servicio.`;
-
-      promesas.push(
-        twilioClient.messages.create({
-          from: `whatsapp:${process.env.TWILIO_SANDBOX_NUMBER}`,
-          to: `whatsapp:+57${t.telefono.replace(/\s/g,'')}`,
-          body: msg
-        }).catch(e => console.log('Error notificando taxista:', t.telefono, e.message))
-      );
-    });
-
-    await Promise.all(promesas);
-  } catch (e) {
-    console.error('Error notificando taxistas:', e);
-  }
-}
-
-// ---- NOTIFICAR CLIENTE CUANDO TAXISTA ACEPTA ----
+// Notificar cliente cuando taxista acepta
 app.post('/notificar-cliente', async (req, res) => {
   const { cliente_telefono, taxista_nombre, placa, taxista_telefono, precio, minutos } = req.body;
-
-  if(!cliente_telefono) return res.status(400).json({ error: 'Falta telefono del cliente' });
-
+  if (!cliente_telefono) return res.status(400).json({ error: 'Falta telefono del cliente' });
   try {
-    const msg = `✅ *¡Tu taxi está en camino!*
-
-🚖 *${taxista_nombre}*
-🚗 Placa: ${placa}
-💰 Precio acordado: $${parseInt(precio).toLocaleString('es-CO')}
-⏱️ Llega en aproximadamente: *${minutos} minutos*
-
-${taxista_telefono ? `📞 Número del taxista: +57${taxista_telefono.replace(/\s/g,'')}` : ''}
-
-Escribe *menu* si necesitas algo más. 🚖`;
-
-    await twilioClient.messages.create({
-      from: `whatsapp:${process.env.TWILIO_SANDBOX_NUMBER}`,
-      to: cliente_telefono,
-      body: msg
-    });
-
+    const precioFormateado = parseInt(precio || 0).toLocaleString('es-CO');
+    const msg = 'Tu taxi esta en camino!\n\nTaxista: ' + taxista_nombre + '\nPlaca: ' + placa + '\nPrecio acordado: $' + precioFormateado + '\nLlega en aproximadamente: ' + minutos + ' minutos\n\nNumero del taxista: +57' + (taxista_telefono || '').replace(/\s/g, '') + '\n\nEscribe menu si necesitas algo mas.';
+    await enviar(cliente_telefono, msg);
     res.json({ ok: true });
   } catch(e) {
     console.error('Error notificando cliente:', e);
@@ -306,10 +261,10 @@ Escribe *menu* si necesitas algo más. 🚖`;
   }
 });
 
-// ---- HEALTH CHECK ----
+// Health check
 app.get('/', (req, res) => {
-  res.json({ status: 'Wazzi Bot corriendo 🚖', version: '1.0' });
+  res.json({ status: 'Wazzi Bot corriendo', version: '1.0' });
 });
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Wazzi Bot corriendo en puerto ${PORT}`));
+const PORT = process.env.PORT || 8080;
+app.listen(PORT, () => console.log('Wazzi Bot corriendo en puerto ' + PORT));
