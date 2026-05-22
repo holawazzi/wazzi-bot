@@ -65,13 +65,16 @@ app.post('/webhook', async (req, res) => {
 
   try {
     // ---- MENU PRINCIPAL ----
-    if (sesion.paso === 'menu' || body === 'menu' || body === '0') {
+    if (body === 'hola' || body === 'menu' || body === '0' || body === 'inicio') {
       sesiones[from] = { paso: 'menu' };
+      respuesta = MENU_PRINCIPAL;
+    }
+    else if (sesion.paso === 'menu' && !['1','2','3','4'].includes(body)) {
       respuesta = MENU_PRINCIPAL;
     }
 
     // ---- OPCION 1: PEDIR TAXI ----
-    else if (sesion.paso === 'menu' && body === '1' || sesion.paso === 'eligiendo_servicio' && sesion.accion === 'pedir') {
+    else if ((sesion.paso === 'menu' && body === '1') || (sesion.paso === 'eligiendo_servicio' && sesion.accion === 'pedir')) {
       sesiones[from] = { paso: 'tipo_servicio', accion: 'pedir' };
       respuesta = MENU_TIPO_SERVICIO;
     }
@@ -236,5 +239,5 @@ app.get('/', (req, res) => {
   res.json({ status: 'Wazzi Bot corriendo 🚖', version: '1.0' });
 });
 
-const PORT = process.env.PORT || 8080;
+const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Wazzi Bot corriendo en puerto ${PORT}`));
