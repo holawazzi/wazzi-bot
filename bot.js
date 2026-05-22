@@ -236,5 +236,5 @@ app.get('/', (req, res) => {
   res.json({ status: 'Wazzi Bot corriendo 🚖', version: '1.0' });
 });
 
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => console.log(`Wazzi Bot corriendo en puerto ${PORT}`));
