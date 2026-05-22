@@ -79,10 +79,7 @@ app.post('/webhook', async (req, res) => {
       } else if (body !== 'menu' && body !== 'hola' && body !== 'inicio' && body !== '0') {
         // No existe y no está en flujo de registro — pedir nombre
         sesiones[from] = { paso: 'pedir_nombre' };
-        respuesta = `👋 ¡Hola! Bienvenido a *Wazzi* 🚖
-Tu servicio de taxis en Villanueva, Casanare.
-
-¿Cuál es tu nombre?`;
+        respuesta = 'Bienvenido a Wazzi! Tu servicio de taxis en Villanueva.\n\nCual es tu nombre?';
       }
     }
 
@@ -102,25 +99,19 @@ Tu servicio de taxis en Villanueva, Casanare.
           fecha_registro: Timestamp.now()
         });
         sesiones[from] = { paso: 'menu', registrado: true, nombre: nombre };
-        respuesta = `¡Hola *${nombre}*! Ya quedaste registrado en Wazzi. 🎉
-
-${MENU_PRINCIPAL}`;
+        re        respuesta = 'Hola ' + nombre + '! Ya quedaste registrado en Wazzi.\n\n' + MENU_PRINCIPAL;
+    
       }
     }
 
     // ---- MENU PRINCIPAL ----
     else if (body === 'hola' || body === 'menu' || body === '0' || body === 'inicio') {
       sesiones[from] = { ...sesion, paso: 'menu' };
-      const saludo = sesion.nombre ? `Hola de nuevo, *${sesion.nombre}*! 👋
-
-` : '';
-      respuesta = saludo + MENU_PRINCIPAL;
+      const salsesion.nombre ? 'Hola de nuevo, ' + sesion.nombre + '!\n\n' : '';     respuesta = saludo + MENU_PRINCIPAL;
     }
     else if (sesion.paso === 'menu' && !['1','2','3','4'].includes(body)) {
-      const saludo = sesion.nombre ? `Hola *${sesion.nombre}*, ` : '';
-      respuesta = saludo ? saludo + 'no entendí esa opción.
-
-' + MENU_PRINCIPAL : MENU_PRINCIPAL;
+      const saludo = sesion.nombre ? 'Hola ' + sesion.nombre + ', ' : '';
+      respuesta = saludo ? saludo + 'no entendi esa opcion.\n\n' + MENU_PRINCIPAL : MENU_PRINCIPAL;
     }
 
     // ---- OPCION 1: PEDIR TAXI ----
