@@ -64,13 +64,63 @@ app.post('/webhook', async (req, res) => {
   let respuesta = '';
 
   try {
+    // ---- VERIFICAR SI EL CLIENTE ESTA REGISTRADO ----
+    if (sesion.paso === 'menu' && !sesion.registrado) {
+      // Buscar en Firebase si ya existe
+      const clienteSnap = await db.collection('usuarios')
+        .where('telefono', '==', from)
+        .limit(1)
+        .get();
+
+      if (!clienteSnap.empty) {
+        // Ya existe — cargar nombre y continuar
+        const clienteData = clienteSnap.docs[0].data();
+        sesiones[from] = { ...sesion, registrado: true, nombre: clienteData.nombre };
+      } else if (body !== 'menu' && body !== 'hola' && body !== 'inicio' && body !== '0') {
+        // No existe y no está en flujo de registro — pedir nombre
+        sesiones[from] = { paso: 'pedir_nombre' };
+        respuesta = `👋 ¡Hola! Bienvenido a *Wazzi* 🚖
+Tu servicio de taxis en Villanueva, Casanare.
+
+¿Cuál es tu nombre?`;
+      }
+    }
+
+    // ---- GUARDAR NOMBRE ----
+    if (sesion.paso === 'pedir_nombre') {
+      const nombre = bodyOriginal.trim();
+      if (nombre.length < 2) {
+        respuesta = '⚠️ Por favor escribe tu nombre completo.';
+      } else {
+        // Guardar en Firebase
+        await db.collection('usuarios').add({
+          nombre: nombre,
+          telefono: from,
+          rol: 'client',
+          ciudad: 'Villanueva',
+          canal: 'whatsapp',
+          fecha_registro: Timestamp.now()
+        });
+        sesiones[from] = { paso: 'menu', registrado: true, nombre: nombre };
+        respuesta = `¡Hola *${nombre}*! Ya quedaste registrado en Wazzi. 🎉
+
+${MENU_PRINCIPAL}`;
+      }
+    }
+
     // ---- MENU PRINCIPAL ----
-    if (body === 'hola' || body === 'menu' || body === '0' || body === 'inicio') {
-      sesiones[from] = { paso: 'menu' };
-      respuesta = MENU_PRINCIPAL;
+    else if (body === 'hola' || body === 'menu' || body === '0' || body === 'inicio') {
+      sesiones[from] = { ...sesion, paso: 'menu' };
+      const saludo = sesion.nombre ? `Hola de nuevo, *${sesion.nombre}*! 👋
+
+` : '';
+      respuesta = saludo + MENU_PRINCIPAL;
     }
     else if (sesion.paso === 'menu' && !['1','2','3','4'].includes(body)) {
-      respuesta = MENU_PRINCIPAL;
+      const saludo = sesion.nombre ? `Hola *${sesion.nombre}*, ` : '';
+      respuesta = saludo ? saludo + 'no entendí esa opción.
+
+' + MENU_PRINCIPAL : MENU_PRINCIPAL;
     }
 
     // ---- OPCION 1: PEDIR TAXI ----
