@@ -23,8 +23,16 @@ const twilioClient = twilio(
   process.env.TWILIO_AUTH_TOKEN
   );
 
-// Sesiones en memoria
-const sesiones = {};
+// Sesiones (persistidas en Firestore para sobrevivir reinicios del servidor)
+async function obtenerSesion(from) {
+  const doc = await db.collection('sesiones').doc(from).get();
+  if (doc.exists) return doc.data();
+  return { paso: 'inicio' };
+}
+
+async function guardarSesion(from, sesion) {
+  await db.collection('sesiones').doc(from).set(sesion);
+}
 
 // Menus
 const MENU = 'Wazzi - Tu servicio de taxis en Villanueva\n\n1. Pedir taxi\n2. Ver taxistas disponibles\n3. Viajes intermunicipales\n4. Negocios de Villanueva\n\nResponde con el numero de tu opcion.';
@@ -90,11 +98,8 @@ app.post('/webhook', async (req, res) => {
 
          if (!from || !body) return res.sendStatus(200);
 
-         if (!sesiones[from]) {
-           sesiones[from] = { paso: 'inicio' };
-         }
-
-         const sesion = sesiones[from];
+         const sesion = await obtenerSesion(from);
+  let nuevaSesion = sesion;
   let respuesta = '';
 
          try {
@@ -103,12 +108,12 @@ app.post('/webhook', async (req, res) => {
   if (sesion.paso === 'inicio' || body === 'menu' || body === 'hola' || body === 'inicio') {
     const cliente = await buscarCliente(from);
     if (cliente) {
-      sesiones[from] = { paso: 'menu', nombre: cliente.nombre, registrado: true };
+      nuevaSesion = { paso: 'menu', nombre: cliente.nombre, registrado: true };
       respuesta = 'Hola de nuevo ' + cliente.nombre + '!\n\n' + MENU;
     } else {
-      sesiones[from] = { paso: 'pedir_nombre' };
+      nuevaSesion = { paso: 'pedir_nombre' };
       respuesta = 'Bienvenido a Wazzi! Tu servicio de taxis en Villanueva, Casanare.\n\nCual es tu nombre?';
-    }
+  }
   }
 
   // PASO: PEDIR NOMBRE
@@ -118,7 +123,7 @@ app.post('/webhook', async (req, res) => {
       respuesta = 'Por favor escribe tu nombre completo.';
     } else {
       await registrarCliente(from, nombre);
-      sesiones[from] = { paso: 'menu', nombre: nombre, registrado: true };
+      nuevaSesion = { paso: 'menu', nombre: nombre, registrado: true };
       respuesta = 'Hola ' + nombre + '! Ya quedaste registrado en Wazzi.\n\n' + MENU;
     }
   }
@@ -127,7 +132,7 @@ app.post('/webhook', async (req, res) => {
   else if (sesion.paso === 'menu') {
 
            if (body === '1') {
-             sesiones[from] = { ...sesion, paso: 'tipo_servicio' };
+             nuevaSesion = { ...sesion, paso: 'tipo_servicio' };
              respuesta = MENU_TIPO;
            }
     else if (body === '2') {
@@ -147,7 +152,7 @@ app.post('/webhook', async (req, res) => {
       }
     }
     else if (body === '3') {
-      sesiones[from] = { ...sesion, paso: 'intermunicipal' };
+      nuevaSesion = { ...sesion, paso: 'intermunicipal' };
       respuesta = 'Viajes intermunicipales disponibles:\n\nYopal\nMonterrey\nTauramena\nAguazul\nBarranca de Upia\nVillavicencio\nCumaral\nRestrepo\n\nEscribe el nombre de la ciudad a donde vas.';
     }
     else if (body === '4') {
@@ -170,16 +175,17 @@ app.post('/webhook', async (req, res) => {
       respuesta = 'No entendi esa opcion.\n\n' + MENU;
     }
   }
-           // TIPO DE SERVICIO
+
+  // TIPO DE SERVICIO
   else if (sesion.paso === 'tipo_servicio') {
     if (body === '1') {
-      sesiones[from] = { ...sesion, paso: 'pedir_origen', tipo: 'local' };
+      nuevaSesion = { ...sesion, paso: 'pedir_origen', tipo: 'local' };
       respuesta = 'Desde donde te recogemos?\n\nEscribe tu direccion o referencia.\nEjemplo: Frente al parque principal';
     } else if (body === '2') {
-      sesiones[from] = { ...sesion, paso: 'pedir_origen', tipo: 'expreso' };
+      nuevaSesion = { ...sesion, paso: 'pedir_origen', tipo: 'expreso' };
       respuesta = 'Desde donde te recogemos?\n\nEscribe tu direccion o referencia.';
     } else if (body === '3') {
-      sesiones[from] = { ...sesion, paso: 'menu' };
+      nuevaSesion = { ...sesion, paso: 'menu' };
       respuesta = MENU;
     } else {
       respuesta = 'Por favor responde con 1, 2 o 3.';
@@ -188,13 +194,13 @@ app.post('/webhook', async (req, res) => {
 
   // PEDIR ORIGEN
   else if (sesion.paso === 'pedir_origen') {
-    sesiones[from] = { ...sesion, paso: 'pedir_destino', origen: bodyOriginal };
+    nuevaSesion = { ...sesion, paso: 'pedir_destino', origen: bodyOriginal };
     respuesta = 'Recojo en: ' + bodyOriginal + '\n\nA donde vas?\n\nEscribe tu destino.';
   }
 
   // PEDIR DESTINO
   else if (sesion.paso === 'pedir_destino') {
-    sesiones[from] = { ...sesion, paso: 'confirmar_pedido', destino: bodyOriginal };
+    nuevaSesion = { ...sesion, paso: 'confirmar_pedido', destino: bodyOriginal };
     const tipoLabel = sesion.tipo === 'local' ? 'Local' : 'Expreso';
     respuesta = 'Confirma tu pedido:\n\nTipo: ' + tipoLabel + '\nDesde: ' + sesion.origen + '\nHasta: ' + bodyOriginal + '\n\n1. Si, pedir taxi\n2. No, cancelar';
   }
@@ -215,33 +221,34 @@ app.post('/webhook', async (req, res) => {
         fecha: Timestamp.now()
       });
       await notificarTaxistas(sesion.origen, sesion.destino, sesion.tipo, pedidoRef.id);
-      sesiones[from] = { paso: 'menu', nombre: sesion.nombre, registrado: true };
+      nuevaSesion = { paso: 'menu', nombre: sesion.nombre, registrado: true };
       respuesta = 'Pedido enviado! Los taxistas ya lo ven.\n\nTe avisamos cuando alguien lo tome.\n\nEscribe menu si necesitas algo mas.';
     } else {
-      sesiones[from] = { ...sesion, paso: 'menu' };
+      nuevaSesion = { ...sesion, paso: 'menu' };
       respuesta = 'Pedido cancelado.\n\n' + MENU;
     }
   }
 
   // INTERMUNICIPAL
   else if (sesion.paso === 'intermunicipal') {
-    sesiones[from] = { ...sesion, paso: 'menu' };
+    nuevaSesion = { ...sesion, paso: 'menu' };
     respuesta = 'Buscando viajes a ' + bodyOriginal + '...\n\nEn este momento no hay viajes publicados a ' + bodyOriginal + '.\n\nPuedes pedir un taxi privado respondiendo 1 en el menu.\n\nEscribe menu para volver.';
   }
 
   // RESPUESTA DESCONOCIDA
   else {
-    sesiones[from] = { paso: 'inicio' };
+    nuevaSesion = { paso: 'inicio' };
     respuesta = MENU;
   }
 
          } catch (error) {
            console.error('Error en bot:', error);
            respuesta = 'Hubo un error. Por favor escribe menu para reiniciar.';
-           sesiones[from] = { paso: 'inicio' };
+           nuevaSesion = { paso: 'inicio' };
          }
 
-         await enviar(from, respuesta);
+         await guardarSesion(from, nuevaSesion);
+  await enviar(from, respuesta);
   res.sendStatus(200);
 });
 
