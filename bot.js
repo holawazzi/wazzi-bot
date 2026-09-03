@@ -12,7 +12,7 @@ initializeApp({
   credential: cert({
     projectId: process.env.FIREBASE_PROJECT_ID,
     clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
-    privateKey: process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n'),
+    privateKey: process.env.FIREBASE_PRIVATE_KEY.replace(/\n/g, '\n'),
   })
 });
 const db = getFirestore();
@@ -78,6 +78,7 @@ async function notificarTaxistas(origen, destino, tipo, pedidoId) {
     for (const doc of snap.docs) {
       const t = doc.data();
       if (!t.telefono) continue;
+      if (!cuentaAlDia(t)) continue;
       const tel = t.telefono.toString().replace(/\s/g, '');
       const msg = 'Nuevo pedido en Wazzi\n\nDesde: ' + origen + '\nHasta: ' + destino + '\nTipo: ' + tipo + '\n\nResponde SI ' + pedidoId + ' para tomar este servicio.';
       try {
@@ -197,13 +198,83 @@ async function reservarCupo(salidaId, cliente) {
 function textoMenuEmpresa(nombreEmpresa) {
   return 'Panel de empresa de transporte - ' + nombreEmpresa + '\n\n1. Agregar nueva ruta\n2. Publicar salida (horario y cupos)\n3. Ver mis rutas activas\n4. Volver al menu principal\n\nResponde con el numero.';
 }
+
+// ===== SUSCRIPCIONES Y PAGOS (taxistas y negocios) =====
+
+// Bandera: mientras este en false, nadie se bloquea por falta de pago.
+// Se activa cuando empecemos a cobrar (en unos meses).
+const COBRO_HABILITADO = false;
+
+function telefonoBase(from) {
+  return (from || '').replace('whatsapp:', '').replace('+57', '').replace(/\s/g, '');
+}
+
+function sumarUnMes(fecha) {
+  const d = new Date(fecha);
+  d.setMonth(d.getMonth() + 1);
+  return d;
+}
+
+// Revisa si una cuenta (taxista o negocio) esta al dia. Si COBRO_HABILITADO es false, siempre esta al dia.
+function cuentaAlDia(datos) {
+  if (!COBRO_HABILITADO) return true;
+  const s = datos.suscripcion;
+  if (!s || !s.activa) return false;
+  if (s.vence && s.vence.toDate() < new Date()) return false;
+  return true;
+}
+
+// Busca si un numero de telefono pertenece a un taxista o a un negocio registrado
+async function buscarCuentaPorTelefono(from) {
+  const tel = telefonoBase(from);
+  let snap = await db.collection('taxistas').where('telefono', '==', tel).limit(1).get();
+  if (!snap.empty) return { tipo: 'taxista', id: snap.docs[0].id, datos: snap.docs[0].data() };
+  snap = await db.collection('negocios').where('telefono', '==', tel).limit(1).get();
+  if (!snap.empty) return { tipo: 'negocio', id: snap.docs[0].id, datos: snap.docs[0].data() };
+  return null;
+}
+
+// Guarda un reporte de pago como pendiente de revision
+async function crearPagoPendiente(cuenta, metodo, monto, mediaUrl, mediaContentType) {
+  const ref = await db.collection('pagos').add({
+    cuenta_tipo: cuenta.tipo,
+    cuenta_id: cuenta.id,
+    cuenta_nombre: cuenta.nombre,
+    cuenta_telefono: cuenta.telefono,
+    metodo: metodo,
+    monto: monto || null,
+    media_url: mediaUrl || null,
+    media_content_type: mediaContentType || null,
+    estado: 'pendiente',
+    fecha_subida: Timestamp.now(),
+    fecha_revision: null
+    });
+  return ref.id;
+}
+
+// Avisa al numero de WhatsApp del administrador que llego un comprobante para revisar
+async function notificarAdminPago(cuenta, metodo, monto) {
+  const admin = process.env.ADMIN_WHATSAPP_NUMBER;
+  if (!admin) { console.log('ADMIN_WHATSAPP_NUMBER no esta configurado, no se pudo avisar del pago.'); return; }
+  const metodoLabel = metodo === 'nequi' ? 'Nequi' : (metodo === 'chancera' ? 'Casa chancera' : 'Efectivo');
+  const montoTexto = monto ? '$' + parseInt(monto).toLocaleString('es-CO') : 'No especificado';
+  const msg = 'Nuevo comprobante de pago en Wazzi\n\n' + (cuenta.tipo === 'taxista' ? 'Taxista' : 'Negocio') + ': ' + cuenta.nombre + '\nMetodo: ' + metodoLabel + '\nValor: ' + montoTexto + '\n\nRevisalo en el panel de administrador, seccion Pagos pendientes.';
+  try {
+    await twilioClient.messages.create({ from: 'whatsapp:' + process.env.TWILIO_SANDBOX_NUMBER, to: admin, body: msg });
+  } catch (e) {
+    console.log('Error notificando pago al admin: ' + e.message);
+  }
+}
 // Webhook principal
 app.post('/webhook', async (req, res) => {
   const from = req.body.From;
   const body = (req.body.Body || '').trim().toLowerCase();
   const bodyOriginal = (req.body.Body || '').trim();
+  const numMedia = parseInt(req.body.NumMedia || '0');
+  const mediaUrl0 = req.body.MediaUrl0 || null;
+  const mediaContentType0 = req.body.MediaContentType0 || null;
 
-         if (!from || !body) return res.sendStatus(200);
+         if (!from || (!body && numMedia === 0)) return res.sendStatus(200);
 
          const sesion = await obtenerSesion(from);
   let nuevaSesion = sesion;
@@ -211,8 +282,19 @@ app.post('/webhook', async (req, res) => {
 
          try {
 
+  // PAGOS: un taxista o negocio puede escribir "pagar" desde cualquier momento para reportar un pago
+  if ((body === 'pagar' || body === 'pago') && !['pago_metodo', 'pago_monto', 'pago_comprobante'].includes(sesion.paso)) {
+    const cuenta = await buscarCuentaPorTelefono(from);
+    if (!cuenta) {
+      respuesta = 'No encontramos una cuenta de taxista o negocio asociada a este numero en Wazzi.\n\nSi eres cliente, escribe menu.';
+    } else {
+      nuevaSesion = { paso: 'pago_metodo', cuenta_tipo: cuenta.tipo, cuenta_id: cuenta.id, cuenta_nombre: cuenta.datos.nombre || cuenta.datos.nombre_negocio || 'Sin nombre' };
+      respuesta = 'Vamos a registrar tu pago de Wazzi.\n\nComo pagaste?\n\n1. Efectivo\n2. Nequi\n3. Casa chancera\n\nResponde con el numero.';
+    }
+  }
+
   // PASO: INICIO - verificar si esta registrado
-  if (sesion.paso === 'inicio' || body === 'menu' || body === 'hola' || body === 'inicio') {
+  else if (sesion.paso === 'inicio' || body === 'menu' || body === 'hola' || body === 'inicio') {
     const cliente = await buscarCliente(from);
     if (cliente) {
       nuevaSesion = { paso: 'menu', nombre: cliente.nombre, registrado: true };
@@ -250,6 +332,7 @@ app.post('/webhook', async (req, res) => {
         let lista = 'Taxistas disponibles ahora:\n\n';
         snap.forEach(doc => {
           const t = doc.data();
+          if (!cuentaAlDia(t)) return;
           lista += t.nombre + ' ' + (t.apellido || '') + '\n';
           lista += 'Placa: ' + (t.placa || 'N/A') + ' - ' + (t.paradero || 'N/A') + '\n';
           lista += 'Servicio: ' + (t.tipo === 'intermunicipal' ? 'Intermunicipal' : 'Local/Expreso') + '\n\n';
@@ -270,6 +353,7 @@ app.post('/webhook', async (req, res) => {
         let lista = 'Negocios de Villanueva:\n\n';
         snap.forEach(doc => {
           const n = doc.data();
+          if (!cuentaAlDia(n)) return;
           lista += n.nombre + ' - ' + n.tipo + '\n';
           lista += 'Tel: ' + n.telefono + '\n';
           if (n.domicilio) lista += 'Hace domicilios\n';
@@ -290,7 +374,7 @@ app.post('/webhook', async (req, res) => {
     }
     else {
       respuesta = 'No entendi esa opcion.\n\n' + MENU;
-    }
+          }
   }
 
   // TIPO DE SERVICIO
@@ -445,7 +529,7 @@ app.post('/webhook', async (req, res) => {
         rutas.forEach(r => { lista += 'Villanueva - ' + r.destino + '\nPrecio: $' + parseInt(r.precio || 0).toLocaleString('es-CO') + ' - Duracion: ' + r.duracion + '\n\n'; });
         respuesta = lista + textoMenuEmpresa(sesion.empresa_nombre);
       }
-          } else if (body === '4') {
+    } else if (body === '4') {
       nuevaSesion = { paso: 'menu' };
       respuesta = MENU;
     } else {
@@ -464,7 +548,7 @@ app.post('/webhook', async (req, res) => {
     const precio = parseInt(body.replace(/\D/g, ''));
     if (isNaN(precio) || precio <= 0) {
       respuesta = 'Por favor escribe solo el numero del precio, ejemplo: 25000';
-    } else {
+      } else {
       nuevaSesion = { ...sesion, paso: 'empresa_ruta_duracion', nueva_ruta_precio: precio };
       respuesta = 'Cuanto dura aproximadamente el viaje? (ejemplo: 2 horas)';
     }
@@ -510,6 +594,41 @@ app.post('/webhook', async (req, res) => {
     }
   }
 
+  // ===== PAGOS: METODO =====
+  else if (sesion.paso === 'pago_metodo') {
+    if (body === '1' || body === '2' || body === '3') {
+      const metodo = body === '1' ? 'efectivo' : (body === '2' ? 'nequi' : 'chancera');
+      nuevaSesion = { ...sesion, paso: 'pago_monto', metodo: metodo };
+      respuesta = 'Cuanto pagaste? (Solo el numero, ejemplo: 30000)';
+    } else {
+      respuesta = 'Por favor responde con 1, 2 o 3.';
+    }
+  }
+
+  // ===== PAGOS: MONTO =====
+  else if (sesion.paso === 'pago_monto') {
+    const monto = parseInt(body.replace(/\D/g, ''));
+    if (isNaN(monto) || monto <= 0) {
+      respuesta = 'Por favor escribe solo el numero del valor pagado, ejemplo: 30000';
+    } else {
+      nuevaSesion = { ...sesion, paso: 'pago_comprobante', monto: monto };
+      respuesta = 'Ahora envia la foto del comprobante (captura de Nequi, foto del recibo, o una foto del pago en efectivo).\n\nSi no tienes foto, escribe NO TENGO.';
+    }
+  }
+
+  // ===== PAGOS: COMPROBANTE =====
+  else if (sesion.paso === 'pago_comprobante') {
+    if (numMedia > 0 || normalizar(body) === 'no tengo') {
+      const cuenta = { tipo: sesion.cuenta_tipo, id: sesion.cuenta_id, nombre: sesion.cuenta_nombre, telefono: telefonoBase(from) };
+      await crearPagoPendiente(cuenta, sesion.metodo, sesion.monto, mediaUrl0, mediaContentType0);
+      await notificarAdminPago(cuenta, sesion.metodo, sesion.monto);
+      nuevaSesion = { paso: 'inicio' };
+      respuesta = 'Listo! Recibimos tu reporte de pago.\n\nEn menos de 24 horas lo confirmamos y tu cuenta de Wazzi queda activa. Gracias!';
+    } else {
+      respuesta = 'Envia la foto del comprobante, o escribe NO TENGO si no tienes una.';
+    }
+  }
+
   // RESPUESTA DESCONOCIDA
   else {
     nuevaSesion = { paso: 'inicio' };
@@ -542,9 +661,84 @@ app.post('/notificar-cliente', async (req, res) => {
   }
 });
 
+// Muestra el comprobante de un pago (Twilio pide autenticacion, por eso este servidor hace de intermediario)
+app.get('/comprobante/:pagoId', async (req, res) => {
+  try {
+    const doc = await db.collection('pagos').doc(req.params.pagoId).get();
+    if (!doc.exists || !doc.data().media_url) return res.status(404).send('No encontrado');
+    const pago = doc.data();
+    const auth = Buffer.from(process.env.TWILIO_ACCOUNT_SID + ':' + process.env.TWILIO_AUTH_TOKEN).toString('base64');
+    const twilioRes = await fetch(pago.media_url, { headers: { Authorization: 'Basic ' + auth } });
+    if (!twilioRes.ok) return res.status(502).send('No se pudo cargar el comprobante');
+    res.set('Content-Type', pago.media_content_type || 'image/jpeg');
+    const buffer = Buffer.from(await twilioRes.arrayBuffer());
+    res.send(buffer);
+  } catch (e) {
+    console.error('Error cargando comprobante:', e);
+    res.status(500).send('Error');
+  }
+});
+
+// Aprueba o rechaza un pago (llamado desde el panel de administrador)
+app.post('/revisar-pago', async (req, res) => {
+  const { pagoId, decision } = req.body;
+  if (!pagoId || !decision) return res.status(400).json({ error: 'Faltan datos' });
+  try {
+    const pagoRef = db.collection('pagos').doc(pagoId);
+    const pagoDoc = await pagoRef.get();
+    if (!pagoDoc.exists) return res.status(404).json({ error: 'Pago no encontrado' });
+    const pago = pagoDoc.data();
+
+  if (decision === 'aprobado') {
+    const coleccion = pago.cuenta_tipo === 'taxista' ? 'taxistas' : 'negocios';
+    const cuentaRef = db.collection(coleccion).doc(pago.cuenta_id);
+    const cuentaDoc = await cuentaRef.get();
+    const suscripcionActual = (cuentaDoc.exists && cuentaDoc.data().suscripcion) || {};
+    const venceActual = suscripcionActual.vence ? suscripcionActual.vence.toDate() : null;
+    const base = (venceActual && venceActual > new Date()) ? venceActual : new Date();
+    const nuevoVence = sumarUnMes(base);
+    await cuentaRef.update({ suscripcion: { activa: true, vence: Timestamp.fromDate(nuevoVence) } });
+    await pagoRef.update({ estado: 'aprobado', fecha_revision: Timestamp.now() });
+    if (pago.cuenta_telefono) {
+      const fechaTexto = nuevoVence.toLocaleDateString('es-CO');
+      await enviar('whatsapp:+57' + pago.cuenta_telefono, 'Tu pago en Wazzi fue confirmado!\n\nTu cuenta esta activa hasta el ' + fechaTexto + '.\n\nGracias por seguir con nosotros.');
+    }
+  } else {
+    await pagoRef.update({ estado: 'rechazado', fecha_revision: Timestamp.now() });
+    if (pago.cuenta_telefono) {
+      await enviar('whatsapp:+57' + pago.cuenta_telefono, 'No pudimos confirmar tu ultimo pago reportado en Wazzi.\n\nEscribe PAGAR para intentarlo de nuevo, o contactanos si crees que es un error.');
+    }
+  }
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('Error revisando pago:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Revisa periodicamente si alguna suscripcion vencio y la desactiva (solo actua si COBRO_HABILITADO)
+async function revisarVencimientos() {
+  if (!COBRO_HABILITADO) return;
+  const ahora = new Date();
+  for (const coleccion of ['taxistas', 'negocios']) {
+    const snap = await db.collection(coleccion).where('suscripcion.activa', '==', true).get();
+    for (const doc of snap.docs) {
+      const datos = doc.data();
+      const vence = datos.suscripcion && datos.suscripcion.vence ? datos.suscripcion.vence.toDate() : null;
+      if (vence && vence < ahora) {
+        await doc.ref.update({ 'suscripcion.activa': false });
+        if (datos.telefono) {
+          await enviar('whatsapp:+57' + datos.telefono, 'Tu suscripcion de Wazzi vencio.\n\nEscribe PAGAR para renovarla y seguir recibiendo pedidos.');
+        }
+      }
+    }
+  }
+}
+setInterval(revisarVencimientos, 1000 * 60 * 60 * 6);
+
 // Health check
 app.get('/', (req, res) => {
-  res.json({ status: 'Wazzi Bot corriendo', version: '1.1' });
+  res.json({ status: 'Wazzi Bot corriendo', version: '1.2' });
 });
 
 const PORT = process.env.PORT || 8080;
