@@ -1,7 +1,7 @@
 const express = require('express');
 const twilio = require('twilio');
 const { initializeApp, cert } = require('firebase-admin/app');
-const { getFirestore, Timestamp } = require('firebase-admin/firestore');
+const { getFirestore, Timestamp, FieldValue } = require('firebase-admin/firestore');
 
 const app = express();
 app.use(express.urlencoded({ extended: false }));
@@ -35,7 +35,7 @@ async function guardarSesion(from, sesion) {
 }
 
 // Menus
-const MENU = 'Wazzi - Tu servicio de taxis en Villanueva\n\n1. Pedir taxi\n2. Ver taxistas disponibles\n3. Viajes intermunicipales\n4. Negocios de Villanueva\n\nResponde con el numero de tu opcion.';
+const MENU = 'Wazzi - Tu servicio de taxis en Villanueva\n\n1. Pedir taxi\n2. Ver taxistas disponibles\n3. Viajes intermunicipales\n4. Negocios de Villanueva\n5. Soy empresa de transporte\n\nResponde con el numero de tu opcion.';
 const MENU_TIPO = 'Que tipo de servicio necesitas?\n\n1. Local - dentro de Villanueva\n2. Expreso - a corregimientos\n3. Volver al menu principal';
 
 // Enviar mensaje WhatsApp
@@ -45,6 +45,11 @@ async function enviar(to, body) {
     to: to,
     body: body
   });
+}
+
+// Quitar tildes y pasar a minusculas, para poder comparar nombres de municipios
+function normalizar(texto) {
+  return (texto || '').toString().normalize('NFD').replace(/[^\x00-\x7F]/g, '').toLowerCase().trim();
 }
 
 // Buscar cliente en Firebase
@@ -90,6 +95,108 @@ async function notificarTaxistas(origen, destino, tipo, pedidoId) {
   }
 }
 
+// ===== EMPRESAS DE TRANSPORTE (buses / carros por puesto) =====
+
+async function buscarEmpresa(telefono) {
+  const doc = await db.collection('empresas_transporte').doc(telefono).get();
+  if (doc.exists) return doc.data();
+  return null;
+}
+
+async function registrarEmpresa(telefono, datos) {
+  await db.collection('empresas_transporte').doc(telefono).set({
+    nombre: datos.nombre,
+    nit: datos.nit,
+    tipo: datos.tipo,
+    telefono: telefono,
+    activa: true,
+    fecha_registro: Timestamp.now()
+  });
+}
+
+async function crearRuta(empresaId, empresaNombre, datos) {
+  const ref = await db.collection('rutas').add({
+    empresa_id: empresaId,
+    empresa_nombre: empresaNombre,
+    origen: 'Villanueva',
+    destino: datos.destino,
+    destino_normalizado: normalizar(datos.destino),
+    precio: datos.precio,
+    duracion: datos.duracion,
+    tipo: datos.tipo,
+    activa: true,
+    fecha_creacion: Timestamp.now()
+  });
+  return ref.id;
+}
+
+async function rutasDeEmpresa(empresaId) {
+  const snap = await db.collection('rutas').where('empresa_id', '==', empresaId).where('activa', '==', true).get();
+  return snap.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+}
+
+async function crearSalida(ruta, datos) {
+  await db.collection('salidas').add({
+    ruta_id: ruta.id,
+    empresa_id: ruta.empresa_id,
+    empresa_nombre: ruta.empresa_nombre,
+    origen: ruta.origen,
+    destino: ruta.destino,
+    destino_normalizado: ruta.destino_normalizado,
+    precio: ruta.precio,
+    tipo: ruta.tipo,
+    hora_salida: datos.hora,
+    cupos_totales: datos.cupos,
+    cupos_disponibles: datos.cupos,
+    activa: true,
+    fecha_creacion: Timestamp.now()
+  });
+}
+
+// Busca salidas con cupos disponibles hacia un destino (de cualquier empresa)
+async function buscarSalidasPorDestino(destino) {
+  const destinoNorm = normalizar(destino);
+  const snap = await db.collection('salidas').where('destino_normalizado', '==', destinoNorm).where('activa', '==', true).get();
+  const salidas = snap.docs
+  .map(doc => ({ id: doc.id, ...doc.data() }))
+  .filter(s => s.cupos_disponibles > 0);
+  salidas.sort((a, b) => (a.hora_salida || '').localeCompare(b.hora_salida || ''));
+  return salidas;
+}
+
+// Reserva un cupo de forma segura (transaccion, para no vender el mismo cupo dos veces)
+async function reservarCupo(salidaId, cliente) {
+  const salidaRef = db.collection('salidas').doc(salidaId);
+  const resultado = await db.runTransaction(async (t) => {
+    const doc = await t.get(salidaRef);
+    if (!doc.exists) return { ok: false, motivo: 'no_existe' };
+    const salida = doc.data();
+    if (!salida.cupos_disponibles || salida.cupos_disponibles < 1) {
+      return { ok: false, motivo: 'sin_cupos' };
+    }
+    t.update(salidaRef, { cupos_disponibles: FieldValue.increment(-1) });
+    return { ok: true, salida: salida };
+  });
+  if (resultado.ok) {
+    await db.collection('reservas_intermunicipales').add({
+      cliente_telefono: cliente.telefono,
+      cliente_nombre: cliente.nombre || 'Cliente WhatsApp',
+      salida_id: salidaId,
+      empresa_nombre: resultado.salida.empresa_nombre,
+      destino: resultado.salida.destino,
+      hora_salida: resultado.salida.hora_salida,
+      precio: resultado.salida.precio,
+      estado: 'confirmada',
+      canal: 'whatsapp',
+      fecha: Timestamp.now()
+    });
+  }
+  return resultado;
+}
+
+function textoMenuEmpresa(nombreEmpresa) {
+  return 'Panel de empresa de transporte - ' + nombreEmpresa + '\n\n1. Agregar nueva ruta\n2. Publicar salida (horario y cupos)\n3. Ver mis rutas activas\n4. Volver al menu principal\n\nResponde con el numero.';
+}
 // Webhook principal
 app.post('/webhook', async (req, res) => {
   const from = req.body.From;
@@ -113,7 +220,7 @@ app.post('/webhook', async (req, res) => {
     } else {
       nuevaSesion = { paso: 'pedir_nombre' };
       respuesta = 'Bienvenido a Wazzi! Tu servicio de taxis en Villanueva, Casanare.\n\nCual es tu nombre?';
-  }
+    }
   }
 
   // PASO: PEDIR NOMBRE
@@ -152,7 +259,7 @@ app.post('/webhook', async (req, res) => {
       }
     }
     else if (body === '3') {
-      nuevaSesion = { ...sesion, paso: 'intermunicipal' };
+      nuevaSesion = { ...sesion, paso: 'intermunicipal_destino' };
       respuesta = 'Viajes intermunicipales disponibles:\n\nYopal\nMonterrey\nTauramena\nAguazul\nBarranca de Upia\nVillavicencio\nCumaral\nRestrepo\n\nEscribe el nombre de la ciudad a donde vas.';
     }
     else if (body === '4') {
@@ -169,6 +276,16 @@ app.post('/webhook', async (req, res) => {
           lista += '\n';
         });
         respuesta = lista;
+      }
+    }
+    else if (body === '5') {
+      const empresa = await buscarEmpresa(from);
+      if (empresa) {
+        nuevaSesion = { paso: 'empresa_menu', empresa_nombre: empresa.nombre };
+        respuesta = textoMenuEmpresa(empresa.nombre);
+      } else {
+        nuevaSesion = { ...sesion, paso: 'empresa_registro_nombre' };
+        respuesta = 'Vamos a registrar tu empresa de transporte en Wazzi.\n\nCual es el nombre de la empresa?';
       }
     }
     else {
@@ -229,10 +346,168 @@ app.post('/webhook', async (req, res) => {
     }
   }
 
-  // INTERMUNICIPAL
-  else if (sesion.paso === 'intermunicipal') {
-    nuevaSesion = { ...sesion, paso: 'menu' };
-    respuesta = 'Buscando viajes a ' + bodyOriginal + '...\n\nEn este momento no hay viajes publicados a ' + bodyOriginal + '.\n\nPuedes pedir un taxi privado respondiendo 1 en el menu.\n\nEscribe menu para volver.';
+  // ===== INTERMUNICIPALES: CLIENTE BUSCANDO VIAJE =====
+  // Cliente escribio la ciudad de destino
+  else if (sesion.paso === 'intermunicipal_destino') {
+    const salidas = await buscarSalidasPorDestino(bodyOriginal);
+    if (salidas.length === 0) {
+      nuevaSesion = { paso: 'menu', nombre: sesion.nombre, registrado: sesion.registrado };
+      respuesta = 'En este momento no hay viajes publicados a ' + bodyOriginal + '.\n\nPuedes pedir un taxi privado respondiendo 1 en el menu.\n\nEscribe menu para volver.';
+    } else {
+      let lista = 'Viajes disponibles a ' + bodyOriginal + ':\n\n';
+      salidas.forEach((s, i) => {
+        lista += (i + 1) + '. ' + s.empresa_nombre + ' - ' + s.hora_salida + ' - $' + parseInt(s.precio || 0).toLocaleString('es-CO') + ' - Cupos: ' + s.cupos_disponibles + '\n';
+      });
+      lista += '\nEscribe el numero del viaje que quieres reservar.';
+      nuevaSesion = { ...sesion, paso: 'intermunicipal_elegir', opciones: salidas.map(s => ({ id: s.id, empresa_nombre: s.empresa_nombre, hora_salida: s.hora_salida, precio: s.precio, destino: s.destino })) };
+      respuesta = lista;
+    }
+  }
+
+  // Cliente elige un numero de la lista de salidas
+  else if (sesion.paso === 'intermunicipal_elegir') {
+    const opciones = sesion.opciones || [];
+    const idx = parseInt(body) - 1;
+    if (isNaN(idx) || idx < 0 || idx >= opciones.length) {
+      respuesta = 'Por favor responde con el numero del viaje que quieres reservar, o escribe menu para volver.';
+    } else {
+      const elegida = opciones[idx];
+      nuevaSesion = { ...sesion, paso: 'intermunicipal_confirmar', salida_elegida: elegida };
+      respuesta = 'Confirma tu reserva:\n\nEmpresa: ' + elegida.empresa_nombre + '\nDestino: ' + elegida.destino + '\nHora: ' + elegida.hora_salida + '\nPrecio: $' + parseInt(elegida.precio || 0).toLocaleString('es-CO') + '\n\n1. Si, reservar cupo\n2. No, cancelar';
+    }
+  }
+
+  // Cliente confirma o cancela la reserva
+  else if (sesion.paso === 'intermunicipal_confirmar') {
+    if (body === '1') {
+      const elegida = sesion.salida_elegida;
+      const resultado = await reservarCupo(elegida.id, { telefono: from, nombre: sesion.nombre });
+      nuevaSesion = { paso: 'menu', nombre: sesion.nombre, registrado: sesion.registrado };
+      if (resultado.ok) {
+        respuesta = 'Cupo reservado!\n\nEmpresa: ' + elegida.empresa_nombre + '\nHora: ' + elegida.hora_salida + '\nPrecio: $' + parseInt(elegida.precio || 0).toLocaleString('es-CO') + '\n\nLlega a tiempo al punto de salida. Escribe menu si necesitas algo mas.';
+      } else {
+        respuesta = 'Justo se agotaron los cupos de ese viaje. Escribe 3 en el menu para ver otras opciones.\n\n' + MENU;
+      }
+    } else {
+      nuevaSesion = { paso: 'menu', nombre: sesion.nombre, registrado: sesion.registrado };
+      respuesta = 'Reserva cancelada.\n\n' + MENU;
+    }
+  }
+
+  // ===== EMPRESAS DE TRANSPORTE: REGISTRO =====
+  else if (sesion.paso === 'empresa_registro_nombre') {
+    if (bodyOriginal.length < 2) {
+      respuesta = 'Por favor escribe el nombre completo de la empresa.';
+    } else {
+      nuevaSesion = { ...sesion, paso: 'empresa_registro_tipo', nuevo_nombre: bodyOriginal };
+      respuesta = 'Que tipo de servicio prestan?\n\n1. Bus o buseta (ruta fija)\n2. Carro por puesto (colectivo)';
+    }
+  }
+
+  else if (sesion.paso === 'empresa_registro_tipo') {
+    if (body === '1' || body === '2') {
+      const tipo = body === '1' ? 'bus' : 'carro';
+      nuevaSesion = { ...sesion, paso: 'empresa_registro_nit', nuevo_tipo: tipo };
+      respuesta = 'Cual es el NIT de la empresa? (Si no tienes, escribe NA)';
+    } else {
+      respuesta = 'Por favor responde con 1 o 2.';
+    }
+  }
+
+  else if (sesion.paso === 'empresa_registro_nit') {
+    await registrarEmpresa(from, { nombre: sesion.nuevo_nombre, tipo: sesion.nuevo_tipo, nit: bodyOriginal });
+    nuevaSesion = { paso: 'empresa_menu', empresa_nombre: sesion.nuevo_nombre };
+    respuesta = 'Listo, ' + sesion.nuevo_nombre + ' ya esta registrada en Wazzi!\n\n' + textoMenuEmpresa(sesion.nuevo_nombre);
+  }
+
+  // ===== EMPRESAS DE TRANSPORTE: PANEL =====
+
+  else if (sesion.paso === 'empresa_menu') {
+    if (body === '1') {
+      nuevaSesion = { ...sesion, paso: 'empresa_ruta_destino' };
+      respuesta = 'A que ciudad va la nueva ruta? (Salida desde Villanueva)\n\nEscribe el nombre del municipio destino.';
+    } else if (body === '2') {
+      const rutas = await rutasDeEmpresa(from);
+      if (rutas.length === 0) {
+        respuesta = 'Todavia no tienes rutas creadas. Escribe 1 para agregar una ruta primero.\n\n' + textoMenuEmpresa(sesion.empresa_nombre);
+      } else {
+        let lista = 'Elige la ruta para publicar una salida:\n\n';
+        rutas.forEach((r, i) => { lista += (i + 1) + '. Villanueva - ' + r.destino + ' ($' + parseInt(r.precio || 0).toLocaleString('es-CO') + ')\n'; });
+        nuevaSesion = { ...sesion, paso: 'empresa_salida_ruta', rutas_disponibles: rutas };
+        respuesta = lista;
+      }
+    } else if (body === '3') {
+      const rutas = await rutasDeEmpresa(from);
+      if (rutas.length === 0) {
+        respuesta = 'Todavia no tienes rutas activas.\n\n' + textoMenuEmpresa(sesion.empresa_nombre);
+      } else {
+        let lista = 'Tus rutas activas:\n\n';
+        rutas.forEach(r => { lista += 'Villanueva - ' + r.destino + '\nPrecio: $' + parseInt(r.precio || 0).toLocaleString('es-CO') + ' - Duracion: ' + r.duracion + '\n\n'; });
+        respuesta = lista + textoMenuEmpresa(sesion.empresa_nombre);
+      }
+          } else if (body === '4') {
+      nuevaSesion = { paso: 'menu' };
+      respuesta = MENU;
+    } else {
+      respuesta = 'No entendi esa opcion.\n\n' + textoMenuEmpresa(sesion.empresa_nombre);
+    }
+  }
+
+  // ===== EMPRESAS DE TRANSPORTE: CREAR RUTA =====
+
+  else if (sesion.paso === 'empresa_ruta_destino') {
+    nuevaSesion = { ...sesion, paso: 'empresa_ruta_precio', nueva_ruta_destino: bodyOriginal };
+    respuesta = 'Cual es el precio del pasaje a ' + bodyOriginal + '? (Solo el numero, ejemplo: 25000)';
+  }
+
+  else if (sesion.paso === 'empresa_ruta_precio') {
+    const precio = parseInt(body.replace(/\D/g, ''));
+    if (isNaN(precio) || precio <= 0) {
+      respuesta = 'Por favor escribe solo el numero del precio, ejemplo: 25000';
+    } else {
+      nuevaSesion = { ...sesion, paso: 'empresa_ruta_duracion', nueva_ruta_precio: precio };
+      respuesta = 'Cuanto dura aproximadamente el viaje? (ejemplo: 2 horas)';
+    }
+  }
+
+  else if (sesion.paso === 'empresa_ruta_duracion') {
+    await crearRuta(from, sesion.empresa_nombre, {
+      destino: sesion.nueva_ruta_destino,
+      precio: sesion.nueva_ruta_precio,
+      duracion: bodyOriginal,
+      tipo: sesion.nuevo_tipo || 'bus'
+    });
+    nuevaSesion = { paso: 'empresa_menu', empresa_nombre: sesion.empresa_nombre };
+    respuesta = 'Ruta creada: Villanueva - ' + sesion.nueva_ruta_destino + ' ($' + parseInt(sesion.nueva_ruta_precio || 0).toLocaleString('es-CO') + ')\n\n' + textoMenuEmpresa(sesion.empresa_nombre);
+  }
+
+  // ===== EMPRESAS DE TRANSPORTE: PUBLICAR SALIDA =====
+
+  else if (sesion.paso === 'empresa_salida_ruta') {
+    const rutas = sesion.rutas_disponibles || [];
+    const idx = parseInt(body) - 1;
+    if (isNaN(idx) || idx < 0 || idx >= rutas.length) {
+      respuesta = 'Por favor responde con el numero de la ruta.';
+    } else {
+      nuevaSesion = { ...sesion, paso: 'empresa_salida_hora', ruta_elegida: rutas[idx] };
+      respuesta = 'A que hora sale? (ejemplo: 6:00 AM)';
+    }
+  }
+
+  else if (sesion.paso === 'empresa_salida_hora') {
+    nuevaSesion = { ...sesion, paso: 'empresa_salida_cupos', nueva_salida_hora: bodyOriginal };
+    respuesta = 'Cuantos cupos disponibles tiene esta salida?';
+  }
+
+  else if (sesion.paso === 'empresa_salida_cupos') {
+    const cupos = parseInt(body.replace(/\D/g, ''));
+    if (isNaN(cupos) || cupos <= 0) {
+      respuesta = 'Por favor escribe solo el numero de cupos disponibles, ejemplo: 15';
+    } else {
+      await crearSalida(sesion.ruta_elegida, { hora: sesion.nueva_salida_hora, cupos: cupos });
+      nuevaSesion = { paso: 'empresa_menu', empresa_nombre: sesion.empresa_nombre };
+      respuesta = 'Salida publicada: Villanueva - ' + sesion.ruta_elegida.destino + ' a las ' + sesion.nueva_salida_hora + ' (' + cupos + ' cupos)\n\n' + textoMenuEmpresa(sesion.empresa_nombre);
+    }
   }
 
   // RESPUESTA DESCONOCIDA
@@ -269,7 +544,7 @@ app.post('/notificar-cliente', async (req, res) => {
 
 // Health check
 app.get('/', (req, res) => {
-  res.json({ status: 'Wazzi Bot corriendo', version: '1.0' });
+  res.json({ status: 'Wazzi Bot corriendo', version: '1.1' });
 });
 
 const PORT = process.env.PORT || 8080;
