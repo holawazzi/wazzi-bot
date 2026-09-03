@@ -205,6 +205,19 @@ function textoMenuEmpresa(nombreEmpresa) {
 // Se activa cuando empecemos a cobrar (en unos meses).
 const COBRO_HABILITADO = false;
 
+// Clave simple para proteger los endpoints del panel de administrador.
+// Se puede sobreescribir con la variable de entorno ADMIN_API_KEY en Railway sin tocar el codigo.
+const ADMIN_KEY = process.env.ADMIN_API_KEY || 'wazzi-panel-2024';
+
+function verificarAdmin(req, res) {
+  const clave = req.headers['x-admin-key'];
+  if (clave !== ADMIN_KEY) {
+    res.status(401).json({ error: 'No autorizado' });
+    return false;
+  }
+  return true;
+}
+
 function telefonoBase(from) {
   return (from || '').replace('whatsapp:', '').replace('+57', '').replace(/\s/g, '');
 }
@@ -248,7 +261,7 @@ async function crearPagoPendiente(cuenta, metodo, monto, mediaUrl, mediaContentT
     estado: 'pendiente',
     fecha_subida: Timestamp.now(),
     fecha_revision: null
-    });
+  });
   return ref.id;
 }
 
@@ -374,7 +387,7 @@ app.post('/webhook', async (req, res) => {
     }
     else {
       respuesta = 'No entendi esa opcion.\n\n' + MENU;
-          }
+    }
   }
 
   // TIPO DE SERVICIO
@@ -385,7 +398,7 @@ app.post('/webhook', async (req, res) => {
     } else if (body === '2') {
       nuevaSesion = { ...sesion, paso: 'pedir_origen', tipo: 'expreso' };
       respuesta = 'Desde donde te recogemos?\n\nEscribe tu direccion o referencia.';
-    } else if (body === '3') {
+                     } else if (body === '3') {
       nuevaSesion = { ...sesion, paso: 'menu' };
       respuesta = MENU;
     } else {
@@ -535,9 +548,9 @@ app.post('/webhook', async (req, res) => {
     } else {
       respuesta = 'No entendi esa opcion.\n\n' + textoMenuEmpresa(sesion.empresa_nombre);
     }
-  }
+                     }
 
-  // ===== EMPRESAS DE TRANSPORTE: CREAR RUTA =====
+      // ===== EMPRESAS DE TRANSPORTE: CREAR RUTA =====
 
   else if (sesion.paso === 'empresa_ruta_destino') {
     nuevaSesion = { ...sesion, paso: 'empresa_ruta_precio', nueva_ruta_destino: bodyOriginal };
@@ -548,7 +561,7 @@ app.post('/webhook', async (req, res) => {
     const precio = parseInt(body.replace(/\D/g, ''));
     if (isNaN(precio) || precio <= 0) {
       respuesta = 'Por favor escribe solo el numero del precio, ejemplo: 25000';
-      } else {
+    } else {
       nuevaSesion = { ...sesion, paso: 'empresa_ruta_duracion', nueva_ruta_precio: precio };
       respuesta = 'Cuanto dura aproximadamente el viaje? (ejemplo: 2 horas)';
     }
@@ -681,6 +694,7 @@ app.get('/comprobante/:pagoId', async (req, res) => {
 
 // Aprueba o rechaza un pago (llamado desde el panel de administrador)
 app.post('/revisar-pago', async (req, res) => {
+  if (!verificarAdmin(req, res)) return;
   const { pagoId, decision } = req.body;
   if (!pagoId || !decision) return res.status(400).json({ error: 'Faltan datos' });
   try {
@@ -736,9 +750,111 @@ async function revisarVencimientos() {
 }
 setInterval(revisarVencimientos, 1000 * 60 * 60 * 6);
 
+// Resumen para el panel de administrador: pagos, empresas de transporte, rutas, salidas y reservas.
+// Junta todo en una sola llamada para que el panel cargue rapido.
+app.get('/admin/resumen', async (req, res) => {
+  if (!verificarAdmin(req, res)) return;
+  try {
+    const [pagosSnap, empresasSnap, rutasSnap, salidasSnap, reservasSnap] = await Promise.all([
+      db.collection('pagos').orderBy('fecha_subida', 'desc').limit(200).get(),
+      db.collection('empresas_transporte').get(),
+      db.collection('rutas').get(),
+      db.collection('salidas').get(),
+      db.collection('reservas_intermunicipales').get()
+      ]);
+
+  const pagos = pagosSnap.docs.map(d => {
+    const p = d.data();
+    return {
+      id: d.id,
+      cuenta_tipo: p.cuenta_tipo || null,
+      cuenta_nombre: p.cuenta_nombre || null,
+      cuenta_telefono: p.cuenta_telefono || null,
+      metodo: p.metodo || null,
+      monto: p.monto || null,
+      estado: p.estado || 'pendiente',
+      tiene_foto: !!p.media_url,
+      fecha_subida: p.fecha_subida && p.fecha_subida.toDate ? p.fecha_subida.toDate().toISOString() : null,
+      fecha_revision: p.fecha_revision && p.fecha_revision.toDate ? p.fecha_revision.toDate().toISOString() : null
+    };
+  });
+
+  const empresas = empresasSnap.docs.map(d => {
+    const e = d.data();
+    return {
+      id: d.id,
+      nombre: e.nombre || null,
+      nit: e.nit || null,
+      tipo: e.tipo || null,
+      telefono: e.telefono || null,
+      activa: !!e.activa,
+      fecha_registro: e.fecha_registro && e.fecha_registro.toDate ? e.fecha_registro.toDate().toISOString() : null
+    };
+  });
+
+  const rutas = rutasSnap.docs.map(d => {
+    const r = d.data();
+    return {
+      id: d.id,
+      empresa_id: r.empresa_id || null,
+      empresa_nombre: r.empresa_nombre || null,
+      origen: r.origen || null,
+      destino: r.destino || null,
+      precio: r.precio || null,
+      duracion: r.duracion || null,
+      tipo: r.tipo || null,
+      activa: !!r.activa
+    };
+  });
+
+  const salidas = salidasSnap.docs.map(d => {
+    const s = d.data();
+    return {
+      id: d.id,
+      empresa_nombre: s.empresa_nombre || null,
+      destino: s.destino || null,
+      hora_salida: s.hora_salida || null,
+      precio: s.precio || null,
+      cupos_totales: s.cupos_totales || 0,
+      cupos_disponibles: s.cupos_disponibles || 0,
+      activa: !!s.activa
+    };
+  });
+
+  const ahora = new Date();
+    const inicioMes = new Date(ahora.getFullYear(), ahora.getMonth(), 1);
+    let ingresosMes = 0;
+    let reservasMes = 0;
+    pagosSnap.docs.forEach(d => {
+      const p = d.data();
+      if (p.estado === 'aprobado' && p.fecha_revision && p.fecha_revision.toDate && p.fecha_revision.toDate() >= inicioMes) {
+        ingresosMes += (p.monto || 0);
+      }
+    });
+    reservasSnap.docs.forEach(d => {
+      const r = d.data();
+      if (r.fecha && r.fecha.toDate && r.fecha.toDate() >= inicioMes) reservasMes++;
+    });
+
+  res.json({
+    pagos,
+    empresas,
+    rutas,
+    salidas,
+    reservas_total: reservasSnap.size,
+    reservas_mes: reservasMes,
+    ingresos_mes: ingresosMes,
+    pagos_pendientes: pagos.filter(p => p.estado === 'pendiente').length
+  });
+  } catch (e) {
+    console.error('Error en /admin/resumen:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // Health check
 app.get('/', (req, res) => {
-  res.json({ status: 'Wazzi Bot corriendo', version: '1.2' });
+  res.json({ status: 'Wazzi Bot corriendo', version: '1.3' });
 });
 
 const PORT = process.env.PORT || 8080;
