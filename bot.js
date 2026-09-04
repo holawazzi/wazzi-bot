@@ -116,6 +116,7 @@ async function registrarEmpresa(telefono, datos) {
     nombre: datos.nombre,
     nit: datos.nit,
     tipo: datos.tipo,
+    pin: datos.pin || null,
     telefono: telefono,
     activa: true,
     fecha_registro: Timestamp.now()
@@ -519,9 +520,19 @@ app.post('/webhook', async (req, res) => {
   }
 
   else if (sesion.paso === 'empresa_registro_nit') {
-    await registrarEmpresa(from, { nombre: sesion.nuevo_nombre, tipo: sesion.nuevo_tipo, nit: bodyOriginal });
-    nuevaSesion = { paso: 'empresa_menu', empresa_nombre: sesion.nuevo_nombre };
-    respuesta = 'Listo, ' + sesion.nuevo_nombre + ' ya esta registrada en Wazzi!\n\n' + textoMenuEmpresa(sesion.nuevo_nombre);
+    nuevaSesion = { ...sesion, paso: 'empresa_registro_pin', nuevo_nit: bodyOriginal };
+    respuesta = 'Crea un PIN de 4 numeros para entrar al panel web de tu empresa (para ver cupos y pasajeros).';
+  }
+
+  else if (sesion.paso === 'empresa_registro_pin') {
+    const pinEmpresa = body.replace(/\D/g, '');
+    if (pinEmpresa.length !== 4) {
+      respuesta = 'El PIN debe ser exactamente 4 numeros. Intenta de nuevo.';
+    } else {
+      await registrarEmpresa(from, { nombre: sesion.nuevo_nombre, tipo: sesion.nuevo_tipo, nit: sesion.nuevo_nit, pin: pinEmpresa });
+      nuevaSesion = { paso: 'empresa_menu', empresa_nombre: sesion.nuevo_nombre };
+      respuesta = 'Listo, ' + sesion.nuevo_nombre + ' ya esta registrada en Wazzi!\n\nPuedes entrar a tu panel web en wazzi-app.vercel.app con tu numero de WhatsApp y este PIN.\n\n' + textoMenuEmpresa(sesion.nuevo_nombre);
+    }
   }
 
   // ===== EMPRESAS DE TRANSPORTE: PANEL =====
