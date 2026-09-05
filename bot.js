@@ -322,15 +322,16 @@ app.post('/webhook', async (req, res) => {
       respuesta = 'Hola de nuevo ' + cliente.nombre + '!\n\n' + MENU;
     } else {
       nuevaSesion = { paso: 'pedir_nombre' };
-      respuesta = 'Bienvenido a Wazzi! Tu servicio de taxis en Villanueva, Casanare.\n\nCual es tu nombre?';
+      respuesta = 'Bienvenido a Wazzi! Tu servicio de taxis en Villanueva, Casanare.\n\nPor seguridad, cual es tu nombre y apellido completos?';
     }
   }
 
   // PASO: PEDIR NOMBRE
   else if (sesion.paso === 'pedir_nombre') {
     const nombre = bodyOriginal.trim();
-    if (nombre.length < 2) {
-      respuesta = 'Por favor escribe tu nombre completo.';
+    const partes = nombre.split(/\s+/).filter(p => p.length > 0);
+    if (partes.length < 2 || partes.some(p => p.length < 2)) {
+      respuesta = 'Por favor escribe tu nombre y apellido completos (ejemplo: Juan Perez).';
     } else {
       await registrarCliente(from, nombre);
       nuevaSesion = { paso: 'menu', nombre: nombre, registrado: true };
